@@ -239,9 +239,11 @@ impl AppDelegate<AppState> for Delegate {
                         }
                     }
                 };
-                println!("KEY = {:?}", c);
-                if let Some(pair) = unsafe { PTY_WRITER.get_mut() } {
-                    _ = pair.0.master.write(&[c as u8]);
+                if c != 0 {
+                    if let Some(pair) = unsafe { PTY_WRITER.get_mut() } {
+                        println!("KEY = {:?}", c);
+                        _ = pair.0.master.write(&[c as u8]);
+                    }
                 }
             }
             _ => {}
