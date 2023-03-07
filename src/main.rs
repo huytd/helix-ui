@@ -139,6 +139,9 @@ fn ui() -> impl Widget<AppState> {
             _ => {}
         }
 
+        // Draw text content
+        layout.draw(ctx, (0.0, 0.0));
+
         // Draw cursor
         let (cursor_row, cursor_col) = data.cursor_pos;
         let grid_rect = Rect::new(
@@ -148,16 +151,26 @@ fn ui() -> impl Widget<AppState> {
             cell_height * cursor_row as f64 + cell_height,
         )
         .to_rounded_rect(2.0);
+        // Text under cursor
+        let mut cursor_text_layout =
+            TextLayout::<String>::from_text(data.grid[cursor_row][cursor_col]);
+        cursor_text_layout.set_font(FontDescriptor::new(FontFamily::MONOSPACE).with_size(12.0));
+        cursor_text_layout.set_text_color(Color::BLACK);
+        cursor_text_layout.rebuild_if_needed(ctx.text(), env);
         if mode.eq("INS") {
             let cursor_brush = ctx.solid_brush(Color::rgb(1.0, 0.87, 0.01));
             ctx.stroke(grid_rect, &cursor_brush, 1.0);
         } else {
-            let cursor_brush = ctx.solid_brush(Color::rgb(1.0, 0.87, 0.01).with_alpha(0.45));
+            let cursor_brush = ctx.solid_brush(Color::rgb(1.0, 0.87, 0.01));
             ctx.fill(grid_rect, &cursor_brush);
+            cursor_text_layout.draw(
+                ctx,
+                (
+                    cell_width * cursor_col as f64,
+                    cell_height * cursor_row as f64,
+                ),
+            );
         }
-
-        // Draw text content
-        layout.draw(ctx, (0.0, 0.0));
     })
 }
 
