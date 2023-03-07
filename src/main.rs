@@ -152,8 +152,8 @@ impl Perform for ANSIParser {
                 let mut p = params.iter();
                 let row = p.next().unwrap().first().unwrap();
                 let col = p.next().unwrap().first().unwrap();
-                self.row = (*row).into();
-                self.col = (*col).into();
+                self.row = row.saturating_sub(1).into();
+                self.col = col.saturating_sub(1).into();
             }
             _ => {}
         }
@@ -169,20 +169,14 @@ struct AppState {
     cursor_pos: (usize, usize),
 }
 
-impl Display for AppState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for row in 0..25 {
-            for col in 0..81 {
-                write!(f, "{}", self.grid[row][col].content)?;
-            }
-            write!(f, "\n")?;
-        }
-        write!(f, "")
-    }
-}
-
 fn ui() -> impl Widget<AppState> {
     Painter::new(|ctx, data: &AppState, env| {
+        let bg_color = data.grid[0][0].bg.unwrap_or(Color::TRANSPARENT);
+        let screen_size = ctx.size();
+        let screen_rect = Rect::new(0., 0., screen_size.width, screen_size.height);
+        let screen_bg_brush = ctx.solid_brush(bg_color);
+        ctx.fill(screen_rect, &screen_bg_brush);
+
         // Calculate a single cell's size
         let mut letter_layout = TextLayout::<String>::from_text("H");
         letter_layout.set_font(FontDescriptor::new(FontFamily::MONOSPACE).with_size(12.0));
@@ -191,11 +185,12 @@ fn ui() -> impl Widget<AppState> {
         let cell_width = cell_size.width;
         let cell_height = cell_size.height;
 
-        // Draw mode
-        let mode: String = data.grid[23][2..=4]
+        // Get current editing mode
+        let mode: String = data.grid[22][1..4]
             .into_iter()
             .map(|cell| cell.content)
             .collect();
+        let should_draw_mode = ["NOR", "INS", "SEL"].contains(&&mode.as_str());
 
         // Draw text content
         for row in 0..=24 {
@@ -210,15 +205,18 @@ fn ui() -> impl Widget<AppState> {
                 .new_text_layout(line_text)
                 .font(FontFamily::MONOSPACE, 12.0)
                 .text_color(Color::WHITE);
+
             for (col, cell) in data.grid[row].iter().enumerate() {
-                let cell_rect = Rect::new(
-                    cell_width * col as f64,
-                    cell_height * row as f64,
-                    cell_width * col as f64 + cell_width,
-                    cell_height * row as f64 + cell_height,
-                );
-                let cell_brush = ctx.solid_brush(cell.bg.unwrap_or(Color::TRANSPARENT));
-                ctx.fill(cell_rect, &cell_brush);
+                if row < 22 || !should_draw_mode {
+                    let cell_rect = Rect::new(
+                        cell_width * col as f64,
+                        cell_height * row as f64,
+                        cell_width * col as f64 + cell_width,
+                        cell_height * row as f64 + cell_height,
+                    );
+                    let cell_brush = ctx.solid_brush(cell.bg.unwrap_or(Color::TRANSPARENT));
+                    ctx.fill(cell_rect, &cell_brush);
+                }
 
                 // Draw
                 let text_color = cell.fg.unwrap_or(Color::WHITE);
@@ -233,6 +231,37 @@ fn ui() -> impl Widget<AppState> {
 
             let text_layout = layout_builder.build().unwrap();
             ctx.draw_text(&text_layout, (0., cell_height * row as f64));
+        }
+
+        // Draw mode badge
+        let mut mode_text_layout = TextLayout::<String>::from_text(mode.to_owned());
+        mode_text_layout.set_font(FontDescriptor::new(FontFamily::MONOSPACE).with_size(12.0));
+        mode_text_layout.set_text_color(Color::BLACK);
+        mode_text_layout.rebuild_if_needed(ctx.text(), env);
+        let mode_rect = Rect::new(
+            cell_width * 1. - 2.5,
+            cell_height * 22.,
+            cell_width * 1. + 3. * cell_width + 5.0,
+            cell_height * 22. + cell_height,
+        )
+        .to_rounded_rect(2.0);
+        match mode.as_str() {
+            "NOR" => {
+                let normal_mode_brush = ctx.solid_brush(Color::rgb(0.68, 0.75, 0.75));
+                ctx.fill(mode_rect, &normal_mode_brush);
+                mode_text_layout.draw(ctx, (cell_width * 1. + 2.5, cell_height * 22.));
+            }
+            "INS" => {
+                let insert_mode_brush = ctx.solid_brush(Color::rgb(0.28, 0.80, 0.54));
+                ctx.fill(mode_rect, &insert_mode_brush);
+                mode_text_layout.draw(ctx, (cell_width * 1. + 2.5, cell_height * 22.));
+            }
+            "SEL" => {
+                let select_mode_brush = ctx.solid_brush(Color::rgb(0.71, 0.45, 0.71));
+                ctx.fill(mode_rect, &select_mode_brush);
+                mode_text_layout.draw(ctx, (cell_width * 1. + 2.5, cell_height * 22.));
+            }
+            _ => {}
         }
 
         // Draw cursor
