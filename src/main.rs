@@ -1,17 +1,62 @@
 use std::{fmt::Display, thread};
 
 use druid::{
-    widget::Painter, AppDelegate, AppLauncher, Application, Color, Data, ExtEventSink,
-    FontDescriptor, FontFamily, Handled, Rect, RenderContext, Selector, Target, TextLayout, Widget,
-    WindowDesc,
+    piet::{PietText, Text, TextAttribute, TextLayoutBuilder},
+    widget::Painter,
+    AppDelegate, AppLauncher, Application, Color, Data, ExtEventSink, FontDescriptor, FontFamily,
+    Handled, Rect, RenderContext, Selector, Target, TextLayout, Widget, WindowDesc,
 };
 
 use once_cell::sync::OnceCell;
 use portable_pty::{native_pty_system, CommandBuilder, PtyPair, PtySize};
 use vte::{Params, Parser, Perform};
 
+#[derive(Clone, Copy, Debug, Data, PartialEq, Eq)]
+struct Cell {
+    content: char,
+    bg: Option<Color>,
+    fg: Option<Color>,
+    // TODO: inverse
+}
+
+impl Cell {
+    pub fn new() -> Self {
+        Self {
+            content: ' ',
+            bg: None,
+            fg: None,
+        }
+    }
+
+    pub fn set_content(&mut self, c: &char) {
+        self.content = c.to_owned();
+    }
+
+    pub fn set_bg(&mut self, color: Option<(u16, u16, u16)>) {
+        if let Some(color) = color {
+            let r = color.0 as f64 / 255.0;
+            let g = color.1 as f64 / 255.0;
+            let b = color.2 as f64 / 255.0;
+            self.bg = Some(Color::rgb(r, g, b));
+        } else {
+            self.bg = None;
+        }
+    }
+
+    pub fn set_fg(&mut self, color: Option<(u16, u16, u16)>) {
+        if let Some(color) = color {
+            let r = color.0 as f64 / 255.0;
+            let g = color.1 as f64 / 255.0;
+            let b = color.2 as f64 / 255.0;
+            self.fg = Some(Color::rgb(r, g, b));
+        } else {
+            self.fg = None;
+        }
+    }
+}
+
 struct HelixUIState {
-    grid: Vec<Vec<char>>,
+    grid: Vec<Vec<Cell>>,
     cursor: (usize, usize),
 }
 
@@ -29,7 +74,9 @@ pub const BELL_CHAR: char = 7 as char;
 struct ANSIParser {
     row: usize,
     col: usize,
-    grid: Vec<Vec<char>>,
+    grid: Vec<Vec<Cell>>,
+    current_fg: Option<(u16, u16, u16)>,
+    current_bg: Option<(u16, u16, u16)>,
 }
 
 impl ANSIParser {
@@ -37,14 +84,18 @@ impl ANSIParser {
         Self {
             row: 0,
             col: 0,
-            grid: vec![vec![' '; 81]; 25],
+            grid: vec![vec![Cell::new(); 81]; 25],
+            current_fg: None,
+            current_bg: None,
         }
     }
 }
 
 impl Perform for ANSIParser {
     fn print(&mut self, c: char) {
-        self.grid[self.row][self.col] = c;
+        self.grid[self.row][self.col].set_content(&c);
+        self.grid[self.row][self.col].set_bg(self.current_bg);
+        self.grid[self.row][self.col].set_fg(self.current_fg);
         self.col += 1;
     }
 
@@ -60,9 +111,42 @@ impl Perform for ANSIParser {
 
     fn csi_dispatch(&mut self, params: &Params, _intermediates: &[u8], _ignore: bool, c: char) {
         // CSI sequences https://www.xfree86.org/current/ctlseqs.html
+        // This list is better  https://wezfurlong.org/wezterm/escape-sequences.html
         match c {
             // TODO: Handle [CSI Ps; m] for colors
             // [CSI Ps; Ps H] sequences to control the cursor
+            'm' => {
+                let pm = params.iter().flatten().collect::<Vec<_>>();
+                // println!("CSI :: {:?}", pm);
+
+                let header = pm.iter().take(2).collect::<Vec<_>>();
+                // [38; 2; R; G; B] = Foreground RGB
+                // [48; 2; R; G; B] = Background RGB
+                // [7] = Inverse On
+                // [27] = Inverse Off
+                // [39] = Foreground Default
+                // [49] = Background Default
+                // [0] = Reset
+                match header[..] {
+                    [38, 2] => {
+                        self.current_fg = Some((*pm[2], *pm[3], *pm[4]));
+                    }
+                    [48, 2] => {
+                        self.current_bg = Some((*pm[2], *pm[3], *pm[4]));
+                    }
+                    [39] => {
+                        self.current_fg = None;
+                    }
+                    [49] => {
+                        self.current_bg = None;
+                    }
+                    [0] => {
+                        self.current_fg = None;
+                        self.current_bg = None;
+                    }
+                    _ => {}
+                }
+            }
             'H' => {
                 // cursor moving
                 let mut p = params.iter();
@@ -81,7 +165,7 @@ impl Perform for ANSIParser {
 #[derive(Debug, Clone, PartialEq, Eq, Data)]
 struct AppState {
     #[data(eq)]
-    grid: Vec<Vec<char>>,
+    grid: Vec<Vec<Cell>>,
     cursor_pos: (usize, usize),
 }
 
@@ -89,7 +173,7 @@ impl Display for AppState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for row in 0..25 {
             for col in 0..81 {
-                write!(f, "{}", self.grid[row][col])?;
+                write!(f, "{}", self.grid[row][col].content)?;
             }
             write!(f, "\n")?;
         }
@@ -99,13 +183,6 @@ impl Display for AppState {
 
 fn ui() -> impl Widget<AppState> {
     Painter::new(|ctx, data: &AppState, env| {
-        // Calculating text layout
-        let text = data.to_string();
-        let mut layout = TextLayout::<String>::from_text(text);
-        layout.set_font(FontDescriptor::new(FontFamily::MONOSPACE).with_size(12.0));
-        layout.set_text_color(Color::WHITE);
-        layout.rebuild_if_needed(ctx.text(), env);
-
         // Calculate a single cell's size
         let mut letter_layout = TextLayout::<String>::from_text("H");
         letter_layout.set_font(FontDescriptor::new(FontFamily::MONOSPACE).with_size(12.0));
@@ -115,61 +192,79 @@ fn ui() -> impl Widget<AppState> {
         let cell_height = cell_size.height;
 
         // Draw mode
-        let mode: String = data.grid[23][2..=4].into_iter().collect();
-        let mode_rect = Rect::new(
-            cell_width * 2. - 5.0,
-            cell_height * 23.,
-            cell_width * 2. + 3. * cell_width + 5.0,
-            cell_height * 23. + cell_height,
-        )
-        .to_rounded_rect(2.0);
-        match mode.as_str() {
-            "NOR" => {
-                let normal_mode_brush = ctx.solid_brush(Color::rgb(0.48, 0.55, 0.55));
-                ctx.fill(mode_rect, &normal_mode_brush);
-            }
-            "INS" => {
-                let insert_mode_brush = ctx.solid_brush(Color::rgb(0.08, 0.60, 0.34));
-                ctx.fill(mode_rect, &insert_mode_brush);
-            }
-            "SEL" => {
-                let select_mode_brush = ctx.solid_brush(Color::rgb(0.51, 0.25, 0.51));
-                ctx.fill(mode_rect, &select_mode_brush);
-            }
-            _ => {}
-        }
+        let mode: String = data.grid[23][2..=4]
+            .into_iter()
+            .map(|cell| cell.content)
+            .collect();
 
         // Draw text content
-        layout.draw(ctx, (0.0, 0.0));
+        for row in 0..=24 {
+            let text_ctx: &mut PietText = ctx.text();
+            let line_text = data.grid[row]
+                .iter()
+                .map(|cell| cell.content)
+                .collect::<String>();
+            let chars = line_text.chars().collect::<Vec<char>>();
+            let mut byte_offset = 0;
+            let mut layout_builder = text_ctx
+                .new_text_layout(line_text)
+                .font(FontFamily::MONOSPACE, 12.0)
+                .text_color(Color::WHITE);
+            for (col, cell) in data.grid[row].iter().enumerate() {
+                let cell_rect = Rect::new(
+                    cell_width * col as f64,
+                    cell_height * row as f64,
+                    cell_width * col as f64 + cell_width,
+                    cell_height * row as f64 + cell_height,
+                );
+                let cell_brush = ctx.solid_brush(cell.bg.unwrap_or(Color::TRANSPARENT));
+                ctx.fill(cell_rect, &cell_brush);
+
+                // Draw
+                let text_color = cell.fg.unwrap_or(Color::WHITE);
+                let ch = chars[col];
+                let ch_len = ch.len_utf8();
+                layout_builder = layout_builder.range_attribute(
+                    byte_offset..byte_offset + ch_len,
+                    TextAttribute::TextColor(text_color),
+                );
+                byte_offset += ch_len;
+            }
+
+            let text_layout = layout_builder.build().unwrap();
+            ctx.draw_text(&text_layout, (0., cell_height * row as f64));
+        }
 
         // Draw cursor
         let (cursor_row, cursor_col) = data.cursor_pos;
-        let grid_rect = Rect::new(
-            cell_width * cursor_col as f64,
-            cell_height * cursor_row as f64,
-            cell_width * cursor_col as f64 + cell_width,
-            cell_height * cursor_row as f64 + cell_height,
-        )
-        .to_rounded_rect(2.0);
-        // Text under cursor
-        let mut cursor_text_layout =
-            TextLayout::<String>::from_text(data.grid[cursor_row][cursor_col]);
-        cursor_text_layout.set_font(FontDescriptor::new(FontFamily::MONOSPACE).with_size(12.0));
-        cursor_text_layout.set_text_color(Color::BLACK);
-        cursor_text_layout.rebuild_if_needed(ctx.text(), env);
-        if mode.eq("INS") {
-            let cursor_brush = ctx.solid_brush(Color::rgb(1.0, 0.87, 0.01));
-            ctx.stroke(grid_rect, &cursor_brush, 1.0);
-        } else {
-            let cursor_brush = ctx.solid_brush(Color::rgb(1.0, 0.87, 0.01));
-            ctx.fill(grid_rect, &cursor_brush);
-            cursor_text_layout.draw(
-                ctx,
-                (
-                    cell_width * cursor_col as f64,
-                    cell_height * cursor_row as f64,
-                ),
-            );
+        if cursor_row <= 24 && cursor_col <= 80 {
+            let grid_rect = Rect::new(
+                cell_width * cursor_col as f64,
+                cell_height * cursor_row as f64,
+                cell_width * cursor_col as f64 + cell_width,
+                cell_height * cursor_row as f64 + cell_height,
+            )
+            .to_rounded_rect(2.0);
+            // Text under cursor
+            let mut cursor_text_layout =
+                TextLayout::<String>::from_text(data.grid[cursor_row][cursor_col].content);
+            cursor_text_layout.set_font(FontDescriptor::new(FontFamily::MONOSPACE).with_size(12.0));
+            cursor_text_layout.set_text_color(Color::BLACK);
+            cursor_text_layout.rebuild_if_needed(ctx.text(), env);
+            if mode.eq("INS") {
+                let cursor_brush = ctx.solid_brush(Color::rgb(1.0, 0.87, 0.01));
+                ctx.stroke(grid_rect, &cursor_brush, 1.0);
+            } else {
+                let cursor_brush = ctx.solid_brush(Color::rgb(1.0, 0.87, 0.01));
+                ctx.fill(grid_rect, &cursor_brush);
+                cursor_text_layout.draw(
+                    ctx,
+                    (
+                        cell_width * cursor_col as f64,
+                        cell_height * cursor_row as f64,
+                    ),
+                );
+            }
         }
     })
 }
@@ -188,7 +283,6 @@ impl AppDelegate<AppState> for Delegate {
         if let Some(ui_state) = cmd.get(UPDATE_UI) {
             data.grid = ui_state.grid.to_vec();
             data.cursor_pos = ui_state.cursor;
-            println!("CURSOR POS: {:?}", data.cursor_pos);
             return Handled::Yes;
         }
         if cmd.is(DESTROY_UI) {
@@ -254,7 +348,6 @@ impl AppDelegate<AppState> for Delegate {
                 };
                 if c != 0 {
                     if let Some(pair) = unsafe { PTY_WRITER.get_mut() } {
-                        println!("KEY = {:?}", c);
                         _ = pair.0.master.write(&[c as u8]);
                     }
                 }
@@ -325,7 +418,7 @@ fn main() {
     });
 
     _ = app.delegate(Delegate).launch(AppState {
-        grid: vec![vec![' '; 81]; 25],
+        grid: vec![vec![Cell::new(); 81]; 25],
         cursor_pos: (0, 0),
     });
 }
