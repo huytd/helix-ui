@@ -1,8 +1,8 @@
 use std::{fmt::Display, thread};
 
 use druid::{
-    widget::Painter, AppDelegate, AppLauncher, Color, Data, ExtEventSink, FontDescriptor,
-    FontFamily, Handled, Rect, RenderContext, Selector, Size, Target, TextLayout, Widget,
+    widget::Painter, AppDelegate, AppLauncher, Application, Color, Data, ExtEventSink,
+    FontDescriptor, FontFamily, Handled, Rect, RenderContext, Selector, Target, TextLayout, Widget,
     WindowDesc,
 };
 
@@ -16,6 +16,7 @@ struct HelixUIState {
 }
 
 const UPDATE_UI: Selector<HelixUIState> = Selector::new("helix-ui.update-screen");
+const DESTROY_UI: Selector = Selector::new("helix-ui.destroy");
 
 pub const NEWLINE_CHAR: char = 10 as char;
 pub const SPACE_CHAR: char = 32 as char;
@@ -177,6 +178,10 @@ impl AppDelegate<AppState> for Delegate {
             println!("CURSOR POS: {:?}", data.cursor_pos);
             return Handled::Yes;
         }
+        if cmd.is(DESTROY_UI) {
+            Application::global().quit();
+            return Handled::Yes;
+        }
         druid::Handled::No
     }
 
@@ -191,25 +196,16 @@ impl AppDelegate<AppState> for Delegate {
         let original_event = event.clone();
         match event {
             druid::Event::KeyDown(key_event) => {
-                let mut c: u8 = 0;
                 let modifiers = key_event.mods;
-                match key_event.key {
-                    druid::keyboard_types::Key::Escape => {
-                        c = 27 as u8;
-                    }
-                    druid::keyboard_types::Key::Backspace => {
-                        c = 8 as u8;
-                    }
-                    druid::keyboard_types::Key::Tab => {
-                        c = 9 as u8;
-                    }
-                    druid::keyboard_types::Key::Enter => {
-                        c = 13 as u8;
-                    }
+                let c = match key_event.key {
+                    druid::keyboard_types::Key::Escape => 27 as u8,
+                    druid::keyboard_types::Key::Backspace => 8 as u8,
+                    druid::keyboard_types::Key::Tab => 9 as u8,
+                    druid::keyboard_types::Key::Enter => 13 as u8,
                     _ => {
                         let chs = key_event.key.to_string().chars().next().unwrap();
                         if chs.is_lowercase() && chs.is_alphabetic() && modifiers.ctrl() {
-                            c = match chs {
+                            match chs {
                                 'a' => 0x01 as u8,
                                 'b' => 0x02 as u8,
                                 'c' => 0x03 as u8,
@@ -237,12 +233,13 @@ impl AppDelegate<AppState> for Delegate {
                                 'y' => 0x25 as u8,
                                 'z' => 0x26 as u8,
                                 _ => chs as u8,
-                            };
+                            }
                         } else {
-                            c = key_event.key.legacy_charcode() as u8;
+                            key_event.key.legacy_charcode() as u8
                         }
                     }
-                }
+                };
+                println!("KEY = {:?}", c);
                 if let Some(pair) = unsafe { PTY_WRITER.get_mut() } {
                     _ = pair.0.master.write(&[c as u8]);
                 }
@@ -305,6 +302,10 @@ fn main() {
                     Target::Auto,
                 );
             }
+        }
+        // Helix exit
+        if let Some(sink) = UI_EVENT_SINK.get() {
+            _ = sink.submit_command(DESTROY_UI, (), Target::Auto);
         }
     });
 
