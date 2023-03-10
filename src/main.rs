@@ -1,4 +1,4 @@
-use std::{fmt::Display, thread};
+use std::thread;
 
 use druid::{
     piet::{PietText, Text, TextAttribute, TextLayoutBuilder},
@@ -7,7 +7,7 @@ use druid::{
     Handled, Rect, RenderContext, Selector, Target, TextLayout, Widget, WindowDesc,
 };
 
-use once_cell::sync::OnceCell;
+use once_cell::sync::{Lazy, OnceCell};
 use portable_pty::{native_pty_system, CommandBuilder, PtyPair, PtySize};
 use vte::{Params, Parser, Perform};
 
@@ -63,6 +63,9 @@ struct HelixUIState {
 const UPDATE_UI: Selector<HelixUIState> = Selector::new("helix-ui.update-screen");
 const DESTROY_UI: Selector = Selector::new("helix-ui.destroy");
 
+static mut TERM_SIZE: Lazy<(usize, usize)> = Lazy::new(|| (80, 24));
+static mut CELL_SIZE: Lazy<(f64, f64)> = Lazy::new(|| (0., 0.));
+
 pub const NEWLINE_CHAR: char = 10 as char;
 pub const SPACE_CHAR: char = 32 as char;
 pub const TAB_CHAR: char = 9 as char;
@@ -75,19 +78,33 @@ struct ANSIParser {
     row: usize,
     col: usize,
     grid: Vec<Vec<Cell>>,
+    grid_rows: usize,
+    grid_cols: usize,
     current_fg: Option<(u16, u16, u16)>,
     current_bg: Option<(u16, u16, u16)>,
 }
 
 impl ANSIParser {
-    pub fn new() -> Self {
+    pub fn new(size: &(usize, usize)) -> Self {
         Self {
             row: 0,
             col: 0,
-            grid: vec![vec![Cell::new(); 81]; 25],
+            grid: vec![vec![Cell::new(); size.0]; size.1],
+            grid_rows: size.1,
+            grid_cols: size.0,
             current_fg: None,
             current_bg: None,
         }
+    }
+
+    pub fn resize(&mut self, size: &(usize, usize)) {
+        self.grid = vec![vec![Cell::new(); size.0]; size.1];
+        self.grid_rows = size.1;
+        self.grid_cols = size.0;
+    }
+
+    pub fn get_size(&self) -> (usize, usize) {
+        (self.grid_cols, self.grid_rows)
     }
 }
 
@@ -169,8 +186,62 @@ struct AppState {
     cursor_pos: (usize, usize),
 }
 
-fn ui() -> impl Widget<AppState> {
-    Painter::new(|ctx, data: &AppState, env| {
+struct EditorWidget;
+
+impl Widget<AppState> for EditorWidget {
+    fn event(
+        &mut self,
+        ctx: &mut druid::EventCtx,
+        event: &druid::Event,
+        data: &mut AppState,
+        env: &druid::Env,
+    ) {
+        match event {
+            druid::Event::WindowConnected
+            | druid::Event::WindowCloseRequested
+            | druid::Event::WindowDisconnected
+            | druid::Event::WindowScale(_)
+            | druid::Event::WindowSize(_)
+            | druid::Event::AnimFrame(_) => {
+                ctx.request_update();
+            }
+            _ => {}
+        }
+    }
+
+    fn lifecycle(
+        &mut self,
+        ctx: &mut druid::LifeCycleCtx,
+        event: &druid::LifeCycle,
+        data: &AppState,
+        env: &druid::Env,
+    ) {
+    }
+
+    fn update(
+        &mut self,
+        ctx: &mut druid::UpdateCtx,
+        old_data: &AppState,
+        data: &AppState,
+        env: &druid::Env,
+    ) {
+        ctx.request_paint();
+    }
+
+    fn layout(
+        &mut self,
+        ctx: &mut druid::LayoutCtx,
+        bc: &druid::BoxConstraints,
+        data: &AppState,
+        env: &druid::Env,
+    ) -> druid::Size {
+        bc.max()
+    }
+
+    fn paint(&mut self, ctx: &mut druid::PaintCtx, data: &AppState, env: &druid::Env) {
+        let term_size = unsafe { &TERM_SIZE };
+        let term_cell_size = unsafe { &CELL_SIZE };
+
         let bg_color = data.grid[0][0].bg.unwrap_or(Color::TRANSPARENT);
         let screen_size = ctx.size();
         let screen_rect = Rect::new(0., 0., screen_size.width, screen_size.height);
@@ -185,21 +256,50 @@ fn ui() -> impl Widget<AppState> {
         let cell_width = cell_size.width;
         let cell_height = cell_size.height;
 
+        if cell_width != term_cell_size.0 && cell_height != term_cell_size.1 {
+            unsafe {
+                CELL_SIZE.0 = cell_width;
+                CELL_SIZE.1 = cell_height;
+                // println!("Calculated cell size: {:?}", CELL_SIZE);
+            }
+        }
+
+        // Skip rendering if terminal size mismatch, likely during resizing
+        let grid_cells = data.grid.get(term_size.1 - 2);
+        if grid_cells.is_none() {
+            return;
+        }
         // Get current editing mode
-        let mode: String = data.grid[22][1..4]
+        let mode: String = grid_cells.unwrap()[1..4]
             .into_iter()
             .map(|cell| cell.content)
             .collect();
         let should_draw_mode = ["NOR", "INS", "SEL"].contains(&&mode.as_str());
 
+        let text_ctx: &mut PietText = ctx.text();
+        let content = data
+            .grid
+            .iter()
+            .map(|line| line.iter().map(|cell| cell.content).collect::<String>())
+            .collect::<Vec<String>>()
+            .join("\n");
+        let mut layout_builder = text_ctx
+            .new_text_layout(content)
+            .font(FontFamily::MONOSPACE, 12.0)
+            .text_color(Color::WHITE);
+
+        let text_layout = layout_builder.build().unwrap();
+        ctx.draw_text(&text_layout, (0., 0.));
+
         // Draw text content
-        for row in 0..=24 {
+        /*
+        for row in 0..term_size.1 {
             let text_ctx: &mut PietText = ctx.text();
-            let line_text = data.grid[row]
+            let chars = data.grid[row]
                 .iter()
                 .map(|cell| cell.content)
-                .collect::<String>();
-            let chars = line_text.chars().collect::<Vec<char>>();
+                .collect::<Vec<char>>();
+            let line_text = chars.iter().collect::<String>();
             let mut byte_offset = 0;
             let mut layout_builder = text_ctx
                 .new_text_layout(line_text)
@@ -207,7 +307,9 @@ fn ui() -> impl Widget<AppState> {
                 .text_color(Color::WHITE);
 
             for (col, cell) in data.grid[row].iter().enumerate() {
-                if row < 22 || !should_draw_mode {
+                let ch = chars[col];
+                let ch_len = ch.len_utf8();
+                if row < term_size.1 - 2 || !should_draw_mode {
                     let cell_rect = Rect::new(
                         cell_width * col as f64,
                         cell_height * row as f64,
@@ -220,8 +322,6 @@ fn ui() -> impl Widget<AppState> {
 
                 // Draw
                 let text_color = cell.fg.unwrap_or(Color::WHITE);
-                let ch = chars[col];
-                let ch_len = ch.len_utf8();
                 layout_builder = layout_builder.range_attribute(
                     byte_offset..byte_offset + ch_len,
                     TextAttribute::TextColor(text_color),
@@ -231,7 +331,7 @@ fn ui() -> impl Widget<AppState> {
 
             let text_layout = layout_builder.build().unwrap();
             ctx.draw_text(&text_layout, (0., cell_height * row as f64));
-        }
+        }*/
 
         // Draw mode badge
         let mut mode_text_layout = TextLayout::<String>::from_text(mode.to_owned());
@@ -240,62 +340,66 @@ fn ui() -> impl Widget<AppState> {
         mode_text_layout.rebuild_if_needed(ctx.text(), env);
         let mode_rect = Rect::new(
             cell_width * 1. - 2.5,
-            cell_height * 22.,
+            cell_height * (term_size.1 as f64 - 2.),
             cell_width * 1. + 3. * cell_width + 5.0,
-            cell_height * 22. + cell_height,
+            cell_height * (term_size.1 as f64 - 2.) + cell_height,
         )
         .to_rounded_rect(2.0);
         match mode.as_str() {
             "NOR" => {
                 let normal_mode_brush = ctx.solid_brush(Color::rgb(0.68, 0.75, 0.75));
                 ctx.fill(mode_rect, &normal_mode_brush);
-                mode_text_layout.draw(ctx, (cell_width * 1. + 2.5, cell_height * 22.));
+                mode_text_layout.draw(
+                    ctx,
+                    (
+                        cell_width * 1. + 2.5,
+                        cell_height * (term_size.1 as f64 - 2.),
+                    ),
+                );
             }
             "INS" => {
                 let insert_mode_brush = ctx.solid_brush(Color::rgb(0.28, 0.80, 0.54));
                 ctx.fill(mode_rect, &insert_mode_brush);
-                mode_text_layout.draw(ctx, (cell_width * 1. + 2.5, cell_height * 22.));
+                mode_text_layout.draw(
+                    ctx,
+                    (
+                        cell_width * 1. + 2.5,
+                        cell_height * (term_size.1 as f64 - 2.),
+                    ),
+                );
             }
             "SEL" => {
                 let select_mode_brush = ctx.solid_brush(Color::rgb(0.71, 0.45, 0.71));
                 ctx.fill(mode_rect, &select_mode_brush);
-                mode_text_layout.draw(ctx, (cell_width * 1. + 2.5, cell_height * 22.));
+                mode_text_layout.draw(
+                    ctx,
+                    (
+                        cell_width * 1. + 2.5,
+                        cell_height * (term_size.1 as f64 - 2.),
+                    ),
+                );
             }
             _ => {}
         }
 
         // Draw cursor
         let (cursor_row, cursor_col) = data.cursor_pos;
-        if cursor_row <= 24 && cursor_col <= 80 {
+        if cursor_row <= term_size.1 && cursor_col <= term_size.0 {
             let grid_rect = Rect::new(
                 cell_width * cursor_col as f64,
                 cell_height * cursor_row as f64,
-                cell_width * cursor_col as f64 + cell_width,
+                cell_width * cursor_col as f64 + if mode.eq("INS") { 1.0 } else { cell_width },
                 cell_height * cursor_row as f64 + cell_height,
             )
             .to_rounded_rect(2.0);
-            // Text under cursor
-            let mut cursor_text_layout =
-                TextLayout::<String>::from_text(data.grid[cursor_row][cursor_col].content);
-            cursor_text_layout.set_font(FontDescriptor::new(FontFamily::MONOSPACE).with_size(12.0));
-            cursor_text_layout.set_text_color(Color::BLACK);
-            cursor_text_layout.rebuild_if_needed(ctx.text(), env);
-            if mode.eq("INS") {
-                let cursor_brush = ctx.solid_brush(Color::rgb(1.0, 0.87, 0.01));
-                ctx.stroke(grid_rect, &cursor_brush, 1.0);
-            } else {
-                let cursor_brush = ctx.solid_brush(Color::rgb(1.0, 0.87, 0.01));
-                ctx.fill(grid_rect, &cursor_brush);
-                cursor_text_layout.draw(
-                    ctx,
-                    (
-                        cell_width * cursor_col as f64,
-                        cell_height * cursor_row as f64,
-                    ),
-                );
-            }
+            let cursor_brush = ctx.solid_brush(Color::rgb(1.0, 0.87, 0.01));
+            ctx.stroke(grid_rect, &cursor_brush, 1.0);
         }
-    })
+    }
+}
+
+fn ui() -> impl Widget<AppState> {
+    EditorWidget {}
 }
 
 struct Delegate;
@@ -331,6 +435,16 @@ impl AppDelegate<AppState> for Delegate {
     ) -> Option<druid::Event> {
         let original_event = event.clone();
         match event {
+            druid::Event::WindowSize(new_size) => unsafe {
+                let cell_size = &CELL_SIZE;
+                if cell_size.0 != 0. && cell_size.1 != 0. {
+                    let cols = (new_size.width / cell_size.0) as usize;
+                    let rows = (new_size.height / cell_size.1) as usize;
+                    TERM_SIZE.0 = cols;
+                    TERM_SIZE.1 = rows;
+                    // println!("Resizing Terminal to: {:?}", (rows, cols));
+                }
+            },
             druid::Event::KeyDown(key_event) => {
                 let modifiers = key_event.mods;
                 let c = match key_event.key {
@@ -403,11 +517,13 @@ fn main() {
     let event_sink = app.get_external_handle();
     _ = UI_EVENT_SINK.set(event_sink);
 
+    let term_size = unsafe { &TERM_SIZE };
+
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
-            rows: 24,
-            cols: 80,
+            rows: term_size.1 as u16,
+            cols: term_size.0 as u16,
             pixel_width: 0,
             pixel_height: 0,
         })
@@ -420,8 +536,29 @@ fn main() {
     thread::spawn(move || {
         let mut buf = [0u8; 128];
         let mut parser = Parser::new();
-        let mut ansi = ANSIParser::new();
+        let mut ansi = ANSIParser::new(&term_size);
         while let Ok(len) = reader.read(&mut buf) {
+            let current_term_size = unsafe { &TERM_SIZE };
+            let grid_size = ansi.get_size();
+            // println!(
+            //     "[Thread] TERM_SIZE = {:?} - last term_size = {:?}",
+            //     current_term_size, grid_size
+            // );
+            if current_term_size.0 != grid_size.0 || current_term_size.1 != grid_size.1 {
+                // println!("NEED RESIZE TERMINAL");
+                ansi.resize(current_term_size);
+                unsafe {
+                    if let Some(pair) = PTY_WRITER.get_mut() {
+                        _ = pair.0.master.resize(PtySize {
+                            rows: current_term_size.1 as u16,
+                            cols: current_term_size.0 as u16,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        });
+                    }
+                }
+            }
+
             if len == 0 {
                 break;
             }
